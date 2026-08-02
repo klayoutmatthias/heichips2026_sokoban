@@ -1,0 +1,575 @@
+<?xml version="1.0" encoding="utf-8"?>
+<klayout-macro>
+ <description>Sokoban</description>
+ <version/>
+ <category>pymacros</category>
+ <prolog/>
+ <epilog/>
+ <doc/>
+ <autorun>false</autorun>
+ <autorun-early>false</autorun-early>
+ <priority>0</priority>
+ <shortcut/>
+ <show-in-menu>true</show-in-menu>
+ <group-name/>
+ <menu-path>macros_menu.examples&gt;end("Examples").end</menu-path>
+ <interpreter>python</interpreter>
+ <dsl-interpreter-name/>
+ <text>
+"""
+@title Dynamic database manipulation: a "Sokoban" implementation
+
+This toy application dynamically changes the database to realize a game arena.
+As a trial application, it implements one level of the famous "Sokoban" game. 
+
+https://en.wikipedia.org/wiki/Sokoban
+
+For the license terms see &lt;https://unlicense.org&gt;
+
+Reads levels from files called "*.sok" next to this
+source file.
+
+Sources for levels are:
+* https://www.sourcecode.se/sokoban/levels.php
+  (Download as .txt and rename to .sok)
+* https://github.com/Alonso-del-Arte/sokoban-levels
+
+Disclaimer: the .sok parser is very simplistic.
+
+"""
+
+import math
+import glob
+import os
+import re
+import klayout.lay as klay
+import klayout.db as kdb
+
+# ---------------------------------------------------------------------------
+#  The base class for objects that populate the arena
+
+class GameObject:
+  
+  #  Constructor: each object must have a position
+  def __init__(self, x, y):
+    self.x_init = x
+    self.y_init = y
+
+  #  Helper method: create a cell ("game" is the game controller object)
+  def create_cell(self, game, name):
+    self.x = self.x_init
+    self.y = self.y_init
+    if game.layout().has_cell(name):
+      self.cell_index = game.layout().cell_by_name(name)
+    else:
+      self.cell_index = game.layout().add_cell(name)
+      self.build_cell(game)
+
+  #  Instantiate our cell in the top cell ("game" is the game controller object)
+  def instantiate(self, game):
+    t = kdb.Trans(kdb.Point(self.x*1000, self.y*1000))
+    inst = kdb.CellInstArray(self.cell_index, t)
+    game.topcell.insert(inst)
+
+  #  Predicate telling if we can move
+  #  Reimplemented by the derived classes
+  def can_move(self, level, x, y):
+    return True
+
+  #  Check, if we are at the given position
+  def is_at(self, x, y):
+    return x == self.x and y == self.y
+
+  #  Predicate, telling if we are at the pusher
+  def is_pusher(self):
+    return False
+
+  #  Predicate, telling if we are an obstacle (i.e. a piece of the wall)
+  def is_obstacle(self):
+    return False
+
+  #  Predicate, telling if we are a goal 
+  def is_goal(self):
+    return False
+
+  #  Predicate, telling if we are a box (the "load" to move around) 
+  def is_box(self):
+    return False
+
+# ---------------------------------------------------------------------------
+#  A piece of the wall
+
+class Wall(GameObject):
+
+  def construct(self, game):
+    self.create_cell(game, "wall")
+
+  def build_cell(self, game):
+
+    lay1 = game.create_layer("wall.1", 0xc00000, 0xffc280, 0)
+
+    ystep = 125
+    width = 250
+    for n in range(0, int(1000 / ystep + 0.5)):
+      x = -width / 2 if (n % 2 == 1) else 0
+      while x &lt; 1000:
+        brick = kdb.Box(max(0, x), n * ystep, min(1000, x + width), (n + 1) * ystep)
+        game.layout().cell(self.cell_index).shapes(lay1).insert_box(brick)
+        x += width
+
+  def is_obstacle(self):
+    return True
+
+# ---------------------------------------------------------------------------
+#  A goal
+
+class Goal(GameObject):
+
+  def construct(self, game):
+    self.create_cell(game, "goal")
+
+  def build_cell(self, game):
+
+    lay2 = game.create_layer("goal.2", 0x80ff8d, 0x80ff8d, 0)
+    lay1 = game.create_layer("goal.1", 0x01c04b, 0x01c04b, 0)
+
+    for r in [ [ 0, 50, lay1 ], [ 50, 100, lay2 ], [ 100, 150, lay1 ], [ 150, 200, lay2 ],
+               [ 200, 250, lay1 ], [ 250, 300, lay2 ], [ 300, 350, lay1 ] ]:
+      (r1, r2, lay) = r
+      pointlist = []
+      n = 32
+      for a in range(0, n):
+        x = 500 + r2 * math.cos((2 * math.pi * a) / n)
+        y = 500 + r2 * math.sin((2 * math.pi * a) / n)
+        pointlist.append(kdb.Point(x, y))
+      shape = kdb.Polygon(pointlist)
+      if r[0] &gt; 0: 
+        pointlist = []
+        n = 32
+        for a in range(0, n):
+          x = 500 + r1 * math.cos((2 * math.pi * a) / n)
+          y = 500 + r1 * math.sin((2 * math.pi * a) / n)
+          pointlist.append(kdb.Point(x, y))
+        shape.insert_hole(pointlist)
+      game.layout().cell(self.cell_index).shapes(lay).insert_polygon(shape)
+
+  def is_goal(self):
+    return True
+
+# ---------------------------------------------------------------------------
+#  A box
+
+class Box(GameObject):
+
+  def construct(self, game):
+    self.create_cell(game, "box")
+    self.is_in_goal = False
+
+  def build_cell(self, game):
+
+    lay1 = game.create_layer("box.1", 0xdd9960, 0xaa5500, 0)
+    lay2 = game.create_layer("box.2", 0xaa5500, 0xffffff, 0)
+
+    pts1 = [ [ [ 250, 250 ], [ 250, 750 ], [ 350, 750 ], [ 350, 250 ] ],
+             [ [ 350, 250 ], [ 350, 750 ], [ 450, 750 ], [ 450, 250 ] ],
+             [ [ 450, 250 ], [ 450, 750 ], [ 550, 750 ], [ 550, 250 ] ],
+             [ [ 550, 250 ], [ 550, 750 ], [ 650, 750 ], [ 650, 250 ] ],
+             [ [ 650, 250 ], [ 650, 750 ], [ 750, 750 ], [ 750, 250 ] ] ]
+             
+    pts2 = [ [ [ 100, 250 ], [ 100, 750 ], [ 250, 750 ], [ 250, 250 ] ],
+             [ [ 750, 250 ], [ 750, 750 ], [ 900, 750 ], [ 900, 250 ] ],
+             [ [ 100, 100 ], [ 100, 250 ], [ 900, 250 ], [ 900, 100 ] ],
+             [ [ 100, 750 ], [ 100, 900 ], [ 900, 900 ], [ 900, 750 ] ],
+             [ [ 250, 250 ], [ 250, 350 ], [ 650, 750 ], [ 750, 750 ],
+               [ 750, 650 ], [ 350, 250 ] ] ]
+
+    for pp in pts1:
+      game.layout().cell(self.cell_index).shapes(lay1).insert(pya.Polygon(pp))
+    for pp in pts2:
+      game.layout().cell(self.cell_index).shapes(lay2).insert(pya.Polygon(pp))
+
+  def can_move(self, level, x, y):
+    for o in level.objects():
+      if o.is_at(self.x + x, self.y + y):
+        if o.is_obstacle() or o.is_box():
+          return False
+    return True
+
+  def move(self, level, x, y):
+    self.x += x
+    self.y += y
+    self.is_in_goal = False
+    for o in level.objects():
+      if o.is_goal() and o.is_at(self.x, self.y):
+        self.is_in_goal = True
+
+  def is_box(self):
+    return True
+
+  def in_goal(self):
+    return self.is_in_goal
+
+# ---------------------------------------------------------------------------
+#  The pusher
+
+class Pusher(GameObject):
+
+  def construct(self, game):
+    self.create_cell(game, "pusher")
+
+  def build_cell(self, game):
+
+    lay1 = game.create_layer("pusher.1", 0x6060ff, 0xffffff, 0)
+
+    pts = [ [ [ 400, 880 ], [ 420, 940 ], [ 580, 940 ], [ 600, 880 ], [ 550, 750 ], [ 450, 750 ] ],
+            [ [ 350, 740 ], [ 630, 740 ], [ 710, 640 ], [ 710, 350 ], [ 630, 350 ], [ 630, 610 ],
+              [ 620, 610 ], [ 620, 100 ], [ 700, 100 ], [ 700, 50 ],  [ 505, 50 ],  [ 505, 400 ],
+              [ 495, 400 ], [ 495, 50 ],  [ 300, 50 ],  [ 300, 100 ], [ 380, 100 ], [ 380, 610 ],
+              [ 370, 610 ], [ 370, 350 ], [ 290, 350 ], [ 290, 640 ] ] ]
+
+    for pp in pts:
+      shape = kdb.Polygon(pp)
+      game.layout().cell(self.cell_index).shapes(lay1).insert(shape)
+
+  def can_move(self, level, x, y):
+    for o in level.objects():
+      if o.is_at(self.x + x, self.y + y):
+        if o.is_obstacle():
+          return False
+        elif o.is_box() and not o.can_move(level, x, y):
+          return False
+    return True
+
+  def move(self, level, x, y):
+    self.x += x
+    self.y += y
+    for o in level.objects():
+      if o.is_at(self.x, self.y) and o.is_box():
+        o.move(level, x, y)
+    return True
+
+  def is_pusher(self):
+    return True
+
+# ---------------------------------------------------------------------------
+#  Level - describes a level and the objects on it
+
+class Level:
+  
+  def __init__(self, title):
+    self.title = title
+    self.objs = None
+
+  def ensure_built(self):
+  
+    if self.objs is not None:
+      return
+      
+    self.objs = []
+
+    y = len(self.arena) - 1
+    for l in self.arena:
+      x = 0
+      for o in list(l):
+        if o == '#':
+          self.objs.append(Wall(x, y))
+        elif o == '.':
+          self.objs.append(Goal(x, y))
+        elif o == '$':
+          self.objs.append(Box(x, y))
+        elif o == '*':
+          self.objs.append(Box(x, y))
+          self.objs.append(Goal(x, y))
+        elif o == '@':
+          self.pusher = Pusher(x, y)
+          self.objs.append(self.pusher)
+        elif o == '+':
+          self.pusher = Pusher(x, y)
+          self.objs.append(self.pusher)
+          self.objs.append(Goal(x, y))
+        x += 1
+      y -= 1
+
+  #  iterates over all objects in the arena
+  def objects(self):
+    self.ensure_built()
+    return self.objs
+
+  #  gets the object representing the pusher
+  def pusher(self):
+    self.ensure_built()
+    return self.pusher
+
+# ---------------------------------------------------------------------------
+#  A level collection
+
+def make_default_level():
+
+  level = Level("Default")
+
+  #  This is one example for an arena
+  #  Notation:
+  #    '#': a wall element
+  #    '$': box
+  #    '*': box on goal
+  #    '@': pusher
+  #    '+': pusher on goal
+  #    '.': goal
+  level.arena = [ 
+    '   ####',
+    '####  #',
+    '#     ####',
+    '# $ #  . ##',
+    '#  #   .  #',
+    '## #$$#.  #',
+    '##    #####',
+    '# @ ###',
+    '#   #',
+    '#####',
+  ]
+  
+  return level
+  
+
+
+class LevelCollection:
+
+  def __init__(self):
+  
+    self.levels = []
+    self.levels.append(make_default_level())
+    
+    sok_files = glob.glob(os.path.join(os.path.dirname(__file__), "*.sok"))
+    for f in sok_files:
+      try:
+        with open(f, "r") as fh:
+          self.read_levels(fh)
+      except:
+        continue
+        
+    # drop empty levels
+    self.levels = [ l for l in self.levels if len(l.arena) &gt; 0 ]
+        
+  def read_levels(self, fh):
+  
+    #  The .sok file reader
+    #
+    #  This is a simplistic implementation
+    #  TODO: implement RLE versions and the actual spec
+    #  (I have not seen any RLE-encoded files)
+    #  
+    #  Recognized formats are:
+    #
+    #  1. Multiple mazes of the form
+    #     Title line
+    #     [&lt;optional empty lines&gt;]
+    #     &lt;maze strings&gt;
+    #     [&lt;optional empty lines&gt;]
+    # 
+    #  2. Multiple mazes of the form
+    #     Title: &lt;title&gt;
+    #     &lt;further key:value pairs&gt;    
+    #     [&lt;optional empty lines&gt;]
+    #     &lt;maze strings&gt;
+    #     [&lt;optional empty lines&gt;]
+  
+    level = None
+    m = None
+    title = ""
+    
+    for line in fh:
+      if re.match(r"\s*$", line):
+        pass
+        # empty line
+      elif re.match(r"\s*::", line):
+        pass
+        # comment
+      elif (m := re.match(r"\s*(.*?)\s*:\s*(.*?)\s*$", line)) is not None:
+        if m.group(1).upper() == "TITLE":
+          title = m.group(2)
+        level = None
+      elif re.match(r"\s*#", line):
+        if level is None:
+          level = Level(title)
+          level.arena = []
+          self.levels.append(level)
+        # a level line
+        if level is not None:
+          level.arena.append(line)
+        title = ""
+      elif re.match(r"[^\s]", line):
+        level = None
+        title = line.strip()
+
+# ---------------------------------------------------------------------------
+#  The game controller
+
+class Game:
+
+  def __init__(self):
+  
+    self.levels = LevelCollection()
+    self.level = self.levels.levels[0]
+
+    #  Get the reference to the application object, the main window and the menu
+    app = klay.Application.instance()
+    mw = app.main_window()
+    menu = mw.menu()
+
+    #  create the menu actions and register
+    down_handler      = self.make_action("Down",    "Down",  lambda: self.move(0, -1))
+    left_handler      = self.make_action("Left",    "Left",  lambda: self.move(-1, 0))
+    right_handler     = self.make_action("Right",   "Right", lambda: self.move(1, 0))
+    up_handler        = self.make_action("Up",      "Up",    lambda: self.move(0, 1))
+    restart_handler   = self.make_action("Restart", "",      lambda: self.restart())
+
+    #  remove existing menu items (when re-running the macro)
+    for item in menu.group("sokoban_grp"):
+      menu.delete_item(item)
+      
+    #  add new menu entries into the toolbar and bind them to our action handlers
+    where = "@toolbar.end"
+    menu.insert_separator(where, "sokoban:sokoban_grp")
+    menu.insert_item(where, "sokoban_down:sokoban_grp",    down_handler)
+    menu.insert_item(where, "sokoban_left:sokoban_grp",    left_handler)
+    menu.insert_item(where, "sokoban_right:sokoban_grp",   right_handler)
+    menu.insert_item(where, "sokoban_up:sokoban_grp",      up_handler)
+    
+    menu.insert_menu(where, "sokoban_restart:sokoban_grp", restart_handler)
+    
+    index = 0
+    for l in self.levels.levels:
+    
+      level_where = "@toolbar.sokoban_restart.end"
+      level_handler = self.make_action(l.title, "", lambda l=index: self.switch_level(l))
+      menu.insert_item(level_where, f"sokoban_level{index}:sokoban_grp", level_handler)
+      
+      index += 1
+
+    self.create_view()
+    
+  #  creates a LayoutView to host the game
+  def create_view(self):
+  
+    app = klay.Application.instance()
+    mw = app.main_window()
+    
+    #  create a new layout and store a reference to its view objects, layout handle
+    #  and a reference to the top cell
+    mw.create_layout("", 0)
+    self.view = mw.current_view()
+    # enhances quality, but is slow on 4k screens
+    # self.view.set_config("bitmap-oversampling", "3")
+    self.layout = self.view.cellview(0).layout 
+    self.topcell = self.layout().create_cell("game")
+
+    #  initialize the layer list: so far we do not have layers
+    self.layers = {}
+
+    #  create and initialize some dummy objects so it is guaranteed that the layers are
+    #  created in the right order.
+    dummy_objs = [ Wall(0, 0), Goal(0, 0), Box(0, 0), Pusher(0, 0) ]
+    for o in dummy_objs:
+      o.construct(self)
+      
+    # start the game
+    self.restart()
+
+  #  creates a menu action
+  def make_action(self, t, k, action):
+  
+    item = klay.Action()
+    item.title = t
+    item.shortcut = k
+    item.on_triggered = action
+    return item
+
+  # switch to a different level
+  def switch_level(self, index):
+  
+    level = self.levels.levels[index]
+    if self.level != level:
+      self.level = level
+      self.restart()
+    
+  #  start over 
+  def restart(self):
+  
+    #  IMPORTANT: because the user may have closed the view panel or the layout, 
+    #  we need to check, if we still have a valid object
+    if self.view.destroyed():
+      self.create_view()
+    
+    for o in self.level.objects():
+      o.construct(self)
+    self.redraw()
+
+    #  set up the viewer window: select the new cell for top cell, update cell hierarchy browser
+    #  and layer list, fit all and show all levels of hierarchy
+    self.view.select_cell_path([self.topcell.cell_index()], 0)
+    self.view.zoom_fit()
+    self.view.max_hier()
+
+  #  refresh the layout with the current arena setup
+  def redraw(self):
+
+    #  empty the top cell and recreate the instances to the game objects 
+    #  so they appear at their position
+    self.topcell.clear_insts()
+    for o in self.level.objects():
+      o.instantiate(self)
+    self.view.select_cell_path([self.topcell.cell_index()], 0)
+
+  #  move the pusher by the specified distance
+  def move(self, dx, dy):
+
+    #  IMPORTANT: because the user may have closed the view panel or the layout, 
+    #  we need to check, if we still have a valid object
+    if not self.view.destroyed():
+
+      #  check, if we can move the pusher and do so.
+      if self.level.pusher.can_move(self.level, dx, dy):
+        self.level.pusher.move(self.level, dx, dy)
+
+      #  update the arena view
+      self.redraw()
+
+      #  check, if all objects have been moved into their goals
+      all_in_goal = True
+      for o in self.level.objects():
+        if o.is_box() and not o.in_goal():
+          all_in_goal = False
+      if all_in_goal:
+        klay.MessageBox.info("Done", "Congratulations! Goal done.", klay.MessageBox.Ok)
+
+  #  create a layer with the given properties
+  def create_layer(self, name, color, frame_color, stipple, width = 1):
+
+    if not name in self.layers:
+
+      linfo = kdb.LayerInfo()
+      lid = self.layout().insert_layer(linfo)
+      self.layers[name] = lid
+
+      lpp = self.view.end_layers()
+      ln = klay.LayerPropertiesNode()
+      ln.dither_pattern = stipple
+      ln.fill_color = color
+      ln.frame_color = frame_color
+      ln.width = width
+      ln.source_layer_index = lid
+      self.view.insert_layer(lpp, ln)
+
+    else:
+      lid = self.layers[name]
+
+    return lid
+
+# ---------------------------------------------------------------------------
+#  Main application
+
+#  instantiate the game object
+sokoban_game = Game()
+
+</text>
+</klayout-macro>
