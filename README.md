@@ -3,7 +3,7 @@
 See https://en.wikipedia.org/wiki/Sokoban for an
 explanation of the game.
 
-To install, copy this file into the `pymacros` folder
+To install, copy the `sokoban.lym` file into the `pymacros` folder
 in your Klayout home directory. This directory is found
 
 * at `c:\users\<you>\KLayout\pymacros` on Windows
